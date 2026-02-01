@@ -1,93 +1,152 @@
-from modules.patch import patch_all
-
-patch_all()
-
-
 import os
-import random
 import einops
 import torch
 import numpy as np
 
-import comfy.model_management
-import comfy.utils
+import ldm_patched.modules.model_management
+import ldm_patched.modules.model_detection
+import ldm_patched.modules.model_patcher
+import ldm_patched.modules.utils
+import ldm_patched.modules.controlnet
+import modules.sample_hijack
+import ldm_patched.modules.samplers
+import ldm_patched.modules.latent_formats
 
-from comfy.sd import load_checkpoint_guess_config
-from nodes import VAEDecode, EmptyLatentImage, VAEEncode, VAEEncodeTiled, VAEDecodeTiled, VAEEncodeForInpaint
-from comfy.sample import prepare_mask, broadcast_cond, load_additional_models, cleanup_additional_models
-from comfy.model_base import SDXLRefiner
-from comfy.sd import model_lora_keys_unet, model_lora_keys_clip, load_lora
-from modules.samplers_advanced import KSamplerBasic, KSamplerWithRefiner
-
+from ldm_patched.modules.sd import load_checkpoint_guess_config
+from ldm_patched.contrib.external import VAEDecode, EmptyLatentImage, VAEEncode, VAEEncodeTiled, VAEDecodeTiled, \
+    ControlNetApplyAdvanced
+from ldm_patched.contrib.external_freelunch import FreeU_V2
+from ldm_patched.modules.sample import prepare_mask
+from modules.lora import match_lora
+from modules.util import get_file_from_folder_list
+from ldm_patched.modules.lora import model_lora_keys_unet, model_lora_keys_clip
+from modules.config import path_embeddings
+from ldm_patched.contrib.external_model_advanced import ModelSamplingDiscrete, ModelSamplingContinuousEDM
 
 opEmptyLatentImage = EmptyLatentImage()
 opVAEDecode = VAEDecode()
 opVAEEncode = VAEEncode()
 opVAEDecodeTiled = VAEDecodeTiled()
 opVAEEncodeTiled = VAEEncodeTiled()
-opVAEEncodeForInpaint = VAEEncodeForInpaint()
+opControlNetApplyAdvanced = ControlNetApplyAdvanced()
+opFreeU = FreeU_V2()
+opModelSamplingDiscrete = ModelSamplingDiscrete()
+opModelSamplingContinuousEDM = ModelSamplingContinuousEDM()
 
 
 class StableDiffusionModel:
-    def __init__(self, unet, vae, clip, clip_vision, model_filename=None):
-        if isinstance(model_filename, str):
-            is_refiner = isinstance(unet.model, SDXLRefiner)
-            if unet is not None:
-                unet.model.model_file = dict(filename=model_filename, prefix='model')
-            if clip is not None:
-                clip.cond_stage_model.model_file = dict(filename=model_filename, prefix='refiner_clip' if is_refiner else 'base_clip')
-            if vae is not None:
-                vae.first_stage_model.model_file = dict(filename=model_filename, prefix='first_stage_model')
+    def __init__(self, unet=None, vae=None, clip=None, clip_vision=None, filename=None, vae_filename=None):
         self.unet = unet
         self.vae = vae
         self.clip = clip
         self.clip_vision = clip_vision
+        self.filename = filename
+        self.vae_filename = vae_filename
+        self.unet_with_lora = unet
+        self.clip_with_lora = clip
+        self.visited_loras = ''
 
-    def to_meta(self):
+        self.lora_key_map_unet = {}
+        self.lora_key_map_clip = {}
+
         if self.unet is not None:
-            self.unet.model.to('meta')
+            self.lora_key_map_unet = model_lora_keys_unet(self.unet.model, self.lora_key_map_unet)
+            self.lora_key_map_unet.update({x: x for x in self.unet.model.state_dict().keys()})
+
         if self.clip is not None:
-            self.clip.cond_stage_model.to('meta')
-        if self.vae is not None:
-            self.vae.first_stage_model.to('meta')
+            self.lora_key_map_clip = model_lora_keys_clip(self.clip.cond_stage_model, self.lora_key_map_clip)
+            self.lora_key_map_clip.update({x: x for x in self.clip.cond_stage_model.state_dict().keys()})
+
+    @torch.no_grad()
+    @torch.inference_mode()
+    def refresh_loras(self, loras):
+        assert isinstance(loras, list)
+
+        if self.visited_loras == str(loras):
+            return
+
+        self.visited_loras = str(loras)
+
+        if self.unet is None:
+            return
+
+        print(f'Request to load LoRAs {str(loras)} for model [{self.filename}].')
+
+        loras_to_load = []
+
+        for filename, weight in loras:
+            if filename == 'None':
+                continue
+
+            if os.path.exists(filename):
+                lora_filename = filename
+            else:
+                lora_filename = get_file_from_folder_list(filename, modules.config.paths_loras)
+
+            if not os.path.exists(lora_filename):
+                print(f'Lora file not found: {lora_filename}')
+                continue
+
+            loras_to_load.append((lora_filename, weight))
+
+        self.unet_with_lora = self.unet.clone() if self.unet is not None else None
+        self.clip_with_lora = self.clip.clone() if self.clip is not None else None
+
+        for lora_filename, weight in loras_to_load:
+            lora_unmatch = ldm_patched.modules.utils.load_torch_file(lora_filename, safe_load=False)
+            lora_unet, lora_unmatch = match_lora(lora_unmatch, self.lora_key_map_unet)
+            lora_clip, lora_unmatch = match_lora(lora_unmatch, self.lora_key_map_clip)
+
+            if len(lora_unmatch) > 12:
+                # model mismatch
+                continue
+
+            if len(lora_unmatch) > 0:
+                print(f'Loaded LoRA [{lora_filename}] for model [{self.filename}] '
+                      f'with unmatched keys {list(lora_unmatch.keys())}')
+
+            if self.unet_with_lora is not None and len(lora_unet) > 0:
+                loaded_keys = self.unet_with_lora.add_patches(lora_unet, weight)
+                print(f'Loaded LoRA [{lora_filename}] for UNet [{self.filename}] '
+                      f'with {len(loaded_keys)} keys at weight {weight}.')
+                for item in lora_unet:
+                    if item not in loaded_keys:
+                        print("UNet LoRA key skipped: ", item)
+
+            if self.clip_with_lora is not None and len(lora_clip) > 0:
+                loaded_keys = self.clip_with_lora.add_patches(lora_clip, weight)
+                print(f'Loaded LoRA [{lora_filename}] for CLIP [{self.filename}] '
+                      f'with {len(loaded_keys)} keys at weight {weight}.')
+                for item in lora_clip:
+                    if item not in loaded_keys:
+                        print("CLIP LoRA key skipped: ", item)
 
 
 @torch.no_grad()
 @torch.inference_mode()
-def load_model(ckpt_filename):
-    unet, clip, vae, clip_vision = load_checkpoint_guess_config(ckpt_filename)
-    return StableDiffusionModel(unet=unet, clip=clip, vae=vae, clip_vision=clip_vision, model_filename=ckpt_filename)
+def apply_freeu(model, b1, b2, s1, s2):
+    return opFreeU.patch(model=model, b1=b1, b2=b2, s1=s1, s2=s2)[0]
 
 
 @torch.no_grad()
 @torch.inference_mode()
-def load_sd_lora(model, lora_filename, strength_model=1.0, strength_clip=1.0):
-    if strength_model == 0 and strength_clip == 0:
-        return model
+def load_controlnet(ckpt_filename):
+    return ldm_patched.modules.controlnet.load_controlnet(ckpt_filename)
 
-    lora = comfy.utils.load_torch_file(lora_filename, safe_load=False)
 
-    if lora_filename.lower().endswith('.fooocus.patch'):
-        loaded = lora
-    else:
-        key_map = model_lora_keys_unet(model.unet.model)
-        key_map = model_lora_keys_clip(model.clip.cond_stage_model, key_map)
-        loaded = load_lora(lora, key_map)
+@torch.no_grad()
+@torch.inference_mode()
+def apply_controlnet(positive, negative, control_net, image, strength, start_percent, end_percent):
+    return opControlNetApplyAdvanced.apply_controlnet(positive=positive, negative=negative, control_net=control_net,
+        image=image, strength=strength, start_percent=start_percent, end_percent=end_percent)
 
-    new_modelpatcher = model.unet.clone()
-    k = new_modelpatcher.add_patches(loaded, strength_model)
 
-    new_clip = model.clip.clone()
-    k1 = new_clip.add_patches(loaded, strength_clip)
-
-    k = set(k)
-    k1 = set(k1)
-    for x in loaded:
-        if (x not in k) and (x not in k1):
-            print("Lora missed: ", x)
-
-    unet, clip = new_modelpatcher, new_clip
-    return StableDiffusionModel(unet=unet, clip=clip, vae=model.vae, clip_vision=model.clip_vision)
+@torch.no_grad()
+@torch.inference_mode()
+def load_model(ckpt_filename, vae_filename=None):
+    unet, clip, vae, vae_filename, clip_vision = load_checkpoint_guess_config(ckpt_filename, embedding_directory=path_embeddings,
+                                                                vae_filename_param=vae_filename)
+    return StableDiffusionModel(unet=unet, clip=clip, vae=vae, clip_vision=clip_vision, filename=ckpt_filename, vae_filename=vae_filename)
 
 
 @torch.no_grad()
@@ -99,19 +158,39 @@ def generate_empty_latent(width=1024, height=1024, batch_size=1):
 @torch.no_grad()
 @torch.inference_mode()
 def decode_vae(vae, latent_image, tiled=False):
-    return (opVAEDecodeTiled if tiled else opVAEDecode).decode(samples=latent_image, vae=vae)[0]
+    if tiled:
+        return opVAEDecodeTiled.decode(samples=latent_image, vae=vae, tile_size=512)[0]
+    else:
+        return opVAEDecode.decode(samples=latent_image, vae=vae)[0]
 
 
 @torch.no_grad()
 @torch.inference_mode()
 def encode_vae(vae, pixels, tiled=False):
-    return (opVAEEncodeTiled if tiled else opVAEEncode).encode(pixels=pixels, vae=vae)[0]
+    if tiled:
+        return opVAEEncodeTiled.encode(pixels=pixels, vae=vae, tile_size=512)[0]
+    else:
+        return opVAEEncode.encode(pixels=pixels, vae=vae)[0]
 
 
 @torch.no_grad()
 @torch.inference_mode()
 def encode_vae_inpaint(vae, pixels, mask):
-    return opVAEEncodeForInpaint.encode(pixels=pixels, vae=vae, mask=mask)[0]
+    assert mask.ndim == 3 and pixels.ndim == 4
+    assert mask.shape[-1] == pixels.shape[-2]
+    assert mask.shape[-2] == pixels.shape[-3]
+
+    w = mask.round()[..., None]
+    pixels = pixels * (1 - w) + 0.5 * w
+
+    latent = vae.encode(pixels)
+    B, C, H, W = latent.shape
+
+    latent_mask = mask[:, None, :, :]
+    latent_mask = torch.nn.functional.interpolate(latent_mask, size=(H * 8, W * 8), mode="bilinear").round()
+    latent_mask = torch.nn.functional.max_pool2d(latent_mask, (8, 8)).round().to(latent)
+
+    return latent, latent_mask
 
 
 class VAEApprox(torch.nn.Module):
@@ -137,31 +216,36 @@ class VAEApprox(torch.nn.Module):
         return x
 
 
-VAE_approx_model = None
+VAE_approx_models = {}
 
 
 @torch.no_grad()
 @torch.inference_mode()
-def get_previewer(device, latent_format):
-    global VAE_approx_model
+def get_previewer(model):
+    global VAE_approx_models
 
-    if VAE_approx_model is None:
-        from modules.path import vae_approx_path
-        vae_approx_filename = os.path.join(vae_approx_path, 'xlvaeapp.pth')
-        sd = torch.load(vae_approx_filename, map_location='cpu')
+    from modules.config import path_vae_approx
+    is_sdxl = isinstance(model.model.latent_format, ldm_patched.modules.latent_formats.SDXL)
+    vae_approx_filename = os.path.join(path_vae_approx, 'xlvaeapp.pth' if is_sdxl else 'vaeapp_sd15.pth')
+
+    if vae_approx_filename in VAE_approx_models:
+        VAE_approx_model = VAE_approx_models[vae_approx_filename]
+    else:
+        sd = torch.load(vae_approx_filename, map_location='cpu', weights_only=True)
         VAE_approx_model = VAEApprox()
         VAE_approx_model.load_state_dict(sd)
         del sd
         VAE_approx_model.eval()
 
-        if comfy.model_management.should_use_fp16():
+        if ldm_patched.modules.model_management.should_use_fp16():
             VAE_approx_model.half()
             VAE_approx_model.current_type = torch.float16
         else:
             VAE_approx_model.float()
             VAE_approx_model.current_type = torch.float32
 
-        VAE_approx_model.to(comfy.model_management.get_torch_device())
+        VAE_approx_model.to(ldm_patched.modules.model_management.get_torch_device())
+        VAE_approx_models[vae_approx_filename] = VAE_approx_model
 
     @torch.no_grad()
     @torch.inference_mode()
@@ -178,150 +262,65 @@ def get_previewer(device, latent_format):
 
 @torch.no_grad()
 @torch.inference_mode()
-def ksampler(model, positive, negative, latent, seed=None, steps=30, cfg=7.0, sampler_name='dpmpp_fooocus_2m_sde_inpaint_seamless',
+def ksampler(model, positive, negative, latent, seed=None, steps=30, cfg=7.0, sampler_name='dpmpp_2m_sde_gpu',
              scheduler='karras', denoise=1.0, disable_noise=False, start_step=None, last_step=None,
-             force_full_denoise=False, callback_function=None):
-    # SCHEDULERS = ["normal", "karras", "exponential", "simple", "ddim_uniform"]
-    # SAMPLERS = ["euler", "euler_ancestral", "heun", "dpm_2", "dpm_2_ancestral",
-    #             "lms", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_sde", "dpmpp_sde_gpu",
-    #             "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu", "ddim", "uni_pc", "uni_pc_bh2"]
+             force_full_denoise=False, callback_function=None, refiner=None, refiner_switch=-1,
+             previewer_start=None, previewer_end=None, sigmas=None, noise_mean=None, disable_preview=False):
 
-    seed = seed if isinstance(seed, int) else random.randint(1, 2 ** 64)
+    if sigmas is not None:
+        sigmas = sigmas.clone().to(ldm_patched.modules.model_management.get_torch_device())
 
-    device = comfy.model_management.get_torch_device()
     latent_image = latent["samples"]
 
     if disable_noise:
         noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
     else:
         batch_inds = latent["batch_index"] if "batch_index" in latent else None
-        noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
+        noise = ldm_patched.modules.sample.prepare_noise(latent_image, seed, batch_inds)
+
+    if isinstance(noise_mean, torch.Tensor):
+        noise = noise + noise_mean - torch.mean(noise, dim=1, keepdim=True)
 
     noise_mask = None
     if "noise_mask" in latent:
         noise_mask = latent["noise_mask"]
 
-    previewer = get_previewer(device, model.model.latent_format)
+    previewer = get_previewer(model)
 
-    pbar = comfy.utils.ProgressBar(steps)
+    if previewer_start is None:
+        previewer_start = 0
 
-    def callback(step, x0, x, total_steps):
-        y = None
-        if previewer is not None:
-            y = previewer(x0, step, total_steps)
-        if callback_function is not None:
-            callback_function(step, x0, x, total_steps, y)
-        pbar.update_absolute(step + 1, total_steps, None)
-
-    sigmas = None
-    disable_pbar = False
-
-    if noise_mask is not None:
-        noise_mask = prepare_mask(noise_mask, noise.shape, device)
-
-    comfy.model_management.load_model_gpu(model)
-    real_model = model.model
-
-    noise = noise.to(device)
-    latent_image = latent_image.to(device)
-
-    positive_copy = broadcast_cond(positive, noise.shape[0], device)
-    negative_copy = broadcast_cond(negative, noise.shape[0], device)
-
-    models = load_additional_models(positive, negative, model.model_dtype())
-
-    sampler = KSamplerBasic(real_model, steps=steps, device=device, sampler=sampler_name, scheduler=scheduler,
-                       denoise=denoise, model_options=model.model_options)
-
-    samples = sampler.sample(noise, positive_copy, negative_copy, cfg=cfg, latent_image=latent_image,
-                             start_step=start_step, last_step=last_step, force_full_denoise=force_full_denoise,
-                             denoise_mask=noise_mask, sigmas=sigmas, callback=callback, disable_pbar=disable_pbar,
-                             seed=seed)
-
-    samples = samples.cpu()
-
-    cleanup_additional_models(models)
-
-    out = latent.copy()
-    out["samples"] = samples
-
-    return out
-
-
-@torch.no_grad()
-@torch.inference_mode()
-def ksampler_with_refiner(model, positive, negative, refiner, refiner_positive, refiner_negative, latent,
-                          seed=None, steps=30, refiner_switch_step=20, cfg=7.0, sampler_name='dpmpp_fooocus_2m_sde_inpaint_seamless',
-                          scheduler='karras', denoise=1.0, disable_noise=False, start_step=None, last_step=None,
-                          force_full_denoise=False, callback_function=None):
-    # SCHEDULERS = ["normal", "karras", "exponential", "simple", "ddim_uniform"]
-    # SAMPLERS = ["euler", "euler_ancestral", "heun", "dpm_2", "dpm_2_ancestral",
-    #             "lms", "dpm_fast", "dpm_adaptive", "dpmpp_2s_ancestral", "dpmpp_sde", "dpmpp_sde_gpu",
-    #             "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_2m_sde_gpu", "ddim", "uni_pc", "uni_pc_bh2"]
-
-    seed = seed if isinstance(seed, int) else random.randint(1, 2 ** 64)
-
-    device = comfy.model_management.get_torch_device()
-    latent_image = latent["samples"]
-
-    if disable_noise:
-        noise = torch.zeros(latent_image.size(), dtype=latent_image.dtype, layout=latent_image.layout, device="cpu")
-    else:
-        batch_inds = latent["batch_index"] if "batch_index" in latent else None
-        noise = comfy.sample.prepare_noise(latent_image, seed, batch_inds)
-
-    noise_mask = None
-    if "noise_mask" in latent:
-        noise_mask = latent["noise_mask"]
-
-    previewer = get_previewer(device, model.model.latent_format)
-
-    pbar = comfy.utils.ProgressBar(steps)
+    if previewer_end is None:
+        previewer_end = steps
 
     def callback(step, x0, x, total_steps):
+        ldm_patched.modules.model_management.throw_exception_if_processing_interrupted()
         y = None
-        if previewer is not None:
-            y = previewer(x0, step, total_steps)
+        if previewer is not None and not disable_preview:
+            y = previewer(x0, previewer_start + step, previewer_end)
         if callback_function is not None:
-            callback_function(step, x0, x, total_steps, y)
-        pbar.update_absolute(step + 1, total_steps, None)
+            callback_function(previewer_start + step, x0, x, previewer_end, y)
 
-    sigmas = None
     disable_pbar = False
+    modules.sample_hijack.current_refiner = refiner
+    modules.sample_hijack.refiner_switch_step = refiner_switch
+    ldm_patched.modules.samplers.sample = modules.sample_hijack.sample_hacked
 
-    if noise_mask is not None:
-        noise_mask = prepare_mask(noise_mask, noise.shape, device)
+    try:
+        samples = ldm_patched.modules.sample.sample(model,
+                                                    noise, steps, cfg, sampler_name, scheduler,
+                                                    positive, negative, latent_image,
+                                                    denoise=denoise, disable_noise=disable_noise,
+                                                    start_step=start_step,
+                                                    last_step=last_step,
+                                                    force_full_denoise=force_full_denoise, noise_mask=noise_mask,
+                                                    callback=callback,
+                                                    disable_pbar=disable_pbar, seed=seed, sigmas=sigmas)
 
-    comfy.model_management.load_model_gpu(model)
-
-    noise = noise.to(device)
-    latent_image = latent_image.to(device)
-
-    positive_copy = broadcast_cond(positive, noise.shape[0], device)
-    negative_copy = broadcast_cond(negative, noise.shape[0], device)
-
-    refiner_positive_copy = broadcast_cond(refiner_positive, noise.shape[0], device)
-    refiner_negative_copy = broadcast_cond(refiner_negative, noise.shape[0], device)
-
-    models = load_additional_models(positive, negative, model.model_dtype())
-
-    sampler = KSamplerWithRefiner(model=model, refiner_model=refiner, steps=steps, device=device,
-                                  sampler=sampler_name, scheduler=scheduler,
-                                  denoise=denoise, model_options=model.model_options)
-
-    samples = sampler.sample(noise, positive_copy, negative_copy, refiner_positive=refiner_positive_copy,
-                             refiner_negative=refiner_negative_copy, refiner_switch_step=refiner_switch_step,
-                             cfg=cfg, latent_image=latent_image,
-                             start_step=start_step, last_step=last_step, force_full_denoise=force_full_denoise,
-                             denoise_mask=noise_mask, sigmas=sigmas, callback_function=callback, disable_pbar=disable_pbar,
-                             seed=seed)
-
-    samples = samples.cpu()
-
-    cleanup_additional_models(models)
-
-    out = latent.copy()
-    out["samples"] = samples
+        out = latent.copy()
+        out["samples"] = samples
+    finally:
+        modules.sample_hijack.current_refiner = None
 
     return out
 
